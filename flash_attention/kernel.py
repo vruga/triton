@@ -100,3 +100,121 @@ def flash_attn_fwd(
         m_i + tl.log(l_i),
         mask=offs_m < SEQ_Q,
     )
+
+
+# ------------------------------------------------------------------------------
+# Backward: recompute P from saved L (log-sum-exp), then standard attention bwd.
+# dP = dO @ V^T,  dS = P * (dP - rowsum(P*dP)),  dQ += dS @ K * scale,
+# dK += Q^T @ dS * scale,  dV += P^T @ dO.  dK/dV use atomic_add (one writer per block).
+# ------------------------------------------------------------------------------
+
+@triton.jit
+def flash_attn_bwd(
+    Q_ptr, K_ptr, V_ptr,
+    dO_ptr,
+    L_ptr,
+    dQ_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qh, stride_qm, stride_qk,
+    stride_kb, stride_kh, stride_kn, stride_kk,
+    stride_vb, stride_vh, stride_vn, stride_vk,
+    stride_dob, stride_doh, stride_dom, stride_dok,
+    stride_dqb, stride_dqh, stride_dqm, stride_dqk,
+    stride_dkb, stride_dkh, stride_dkn, stride_dkk,
+    stride_dvb, stride_dvh, stride_dvn, stride_dvk,
+    SEQ_Q:    tl.constexpr,
+    SEQ_KV:   tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    tile_m = tl.program_id(0)
+    bh     = tl.program_id(1)
+
+    q_base  = bh * stride_qh
+    k_base  = bh * stride_kh
+    v_base  = bh * stride_vh
+    do_base = bh * stride_doh
+    dq_base = bh * stride_dqh
+    dk_base = bh * stride_dkh
+    dv_base = bh * stride_dvh
+
+    offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_k = tl.arange(0, HEAD_DIM)
+    q_mask = offs_m[:, None] < SEQ_Q
+
+    Q = tl.load(
+        Q_ptr + q_base + offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk,
+        mask=q_mask, other=0.0, eviction_policy="evict_first",
+    )
+    dO = tl.load(
+        dO_ptr + do_base + offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok,
+        mask=q_mask, other=0.0, eviction_policy="evict_first",
+    )
+    L = tl.load(
+        L_ptr + bh * SEQ_Q + offs_m,
+        mask=offs_m < SEQ_Q,
+        other=float("-inf"),
+    )
+
+    Q = Q.to(tl.float32)
+    dO = dO.to(tl.float32)
+    dQ_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    for j in range(tl.cdiv(SEQ_KV, BLOCK_N)):
+        offs_n  = j * BLOCK_N + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < SEQ_KV
+
+        K = tl.load(
+            K_ptr + k_base
+                  + offs_n[None, :] * stride_kn
+                  + offs_k[:, None] * stride_kk,
+            mask=kv_mask[None, :],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        V = tl.load(
+            V_ptr + v_base
+                  + offs_n[:, None] * stride_vn
+                  + offs_k[None, :] * stride_vk,
+            mask=kv_mask[:, None],
+            other=0.0,
+            eviction_policy="evict_last",
+        )
+        K = K.to(tl.float32)
+        V = V.to(tl.float32)
+
+        S = tl.dot(Q, K) * scale
+        S = tl.where(kv_mask[None, :], S, float("-inf"))
+        P = tl.exp(S - L[:, None])
+        P = tl.where(kv_mask[None, :], P, 0.0)
+
+        dP = tl.dot(dO, V)
+        dP = tl.where(kv_mask[None, :], dP, 0.0)
+        dS = P * (dP - tl.sum(P * dP, axis=1)[:, None])
+        dS = tl.where(kv_mask[None, :], dS, 0.0)
+
+        dQ_acc += tl.dot(dS, tl.trans(K)) * scale
+
+        dK_block = (tl.dot(tl.trans(Q), dS) * scale).to(tl.float32)
+        dV_block = (tl.dot(tl.trans(P), dO)).to(tl.float32)
+
+        dK_ptrs = (
+            dK_ptr + dk_base
+            + offs_k[:, None] * stride_dkk
+            + offs_n[None, :] * stride_dkn
+        )
+        dV_ptrs = (
+            dV_ptr + dv_base
+            + offs_n[:, None] * stride_dvn
+            + offs_k[None, :] * stride_dvk
+        )
+        tl.atomic_add(dK_ptrs, dK_block, mask=kv_mask[None, :])
+        tl.atomic_add(dV_ptrs, dV_block, mask=kv_mask[:, None])
+
+    tl.store(
+        dQ_ptr + dq_base + offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk,
+        dQ_acc.to(tl.float16),
+        mask=q_mask,
+        eviction_policy="evict_first",
+    )
